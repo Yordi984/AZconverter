@@ -1,20 +1,26 @@
-# Usa una imagen base de Node.js
-FROM node:20-slim
+# Usar la imagen base de Node.js
+FROM node:20.18.0-slim
 
-# Crea y establece el directorio de trabajo
+# Crear y establecer el directorio de trabajo
 WORKDIR /app
 
-# Copia los archivos de dependencias de Node.js
+# Copiar el package.json y package-lock.json
 COPY package.json package-lock.json ./
 
-# Instala las dependencias
-RUN npm install
+# Instalar pnpm globalmente
+RUN npm install -g pnpm
 
-# Copia el resto del código de tu API
+# Instalar las dependencias de la aplicación
+RUN npm ci --include=dev
+
+# Copiar el resto del código de la aplicación
 COPY . .
 
-# Expón el puerto en el que tu API va a correr
+# Ejecutar el build
+RUN npm run build
+
+# Exponer el puerto en el que tu API corre
 EXPOSE 3000
 
-# Inicia tu aplicación
+# Comando para iniciar la aplicación
 CMD ["npm", "start"]
