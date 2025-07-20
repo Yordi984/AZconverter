@@ -19,11 +19,13 @@ const ytdlp = ytdlpRaw as unknown as (
 app.use(express.json());
 app.use(
   cors({
-    origin: "*", // la URL donde corre tu frontend
-    methods: ["POST"], // métodos permitidos
+    origin: "*",
+    methods: ["POST", "OPTIONS"],
     exposedHeaders: ["Content-Disposition"],
   })
 );
+
+app.options("*", cors());
 
 if (!fs.existsSync(BASE_DOWNLOAD_DIR)) fs.mkdirSync(BASE_DOWNLOAD_DIR);
 
