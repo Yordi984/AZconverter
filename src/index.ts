@@ -22,7 +22,6 @@ app.use(
 // Asegura que el directorio exista
 if (!fs.existsSync(downloadDir)) fs.mkdirSync(downloadDir);
 
-// Ruta para convertir un solo video
 app.post("/download", async (req: Request, res: Response): Promise<void> => {
   const { url } = req.body;
 
@@ -35,6 +34,12 @@ app.post("/download", async (req: Request, res: Response): Promise<void> => {
   }
 
   try {
+    // 🧼 Limpia la carpeta de descargas antes de iniciar
+    fs.readdirSync(downloadDir).forEach((file) => {
+      fs.unlinkSync(path.join(downloadDir, file));
+    });
+
+    // ⬇️ Descarga con yt-dlp
     await ytdlp(url, {
       extractAudio: true,
       audioFormat: "mp3",
@@ -44,23 +49,33 @@ app.post("/download", async (req: Request, res: Response): Promise<void> => {
 
     const files = globSync(`${downloadDir}/*.mp3`);
     if (files.length === 0) {
-      res.status(404).send("No se encontró el archivo MP3");
+      res.status(404).send("❌ No se encontró el archivo MP3");
       return;
     }
 
     const filePath = files[0];
     const fileName = path.basename(filePath);
 
+    // 📏 Asegura que el archivo no esté vacío
+    const stats = fs.statSync(filePath);
+    if (stats.size < 1000) {
+      fs.unlinkSync(filePath);
+      res.status(500).send("❌ El archivo MP3 generado es inválido");
+      return;
+    }
+
+    // ✅ Envía y elimina el archivo
     res.download(filePath, fileName, (err) => {
       if (err) {
         console.error("❌ Error al enviar el archivo:", err);
       } else {
+        console.log("✅ Archivo enviado:", fileName);
         fs.unlinkSync(filePath);
       }
     });
   } catch (error) {
     console.error("❌ Error al procesar el video:", error);
-    res.status(500).send("Error al procesar el video");
+    res.status(500).send("❌ Error al procesar el video");
   }
 });
 
