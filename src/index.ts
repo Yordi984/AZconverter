@@ -19,7 +19,8 @@ const ytdlp = ytdlpRaw as unknown as (
 app.use(express.json());
 app.use(
   cors({
-    origin: "*",
+    origin: "*", // la URL donde corre tu frontend
+    methods: ["POST"], // métodos permitidos
     exposedHeaders: ["Content-Disposition"],
   })
 );
