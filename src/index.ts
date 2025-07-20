@@ -17,7 +17,12 @@ const ytdlp = ytdlpRaw as unknown as (
 ) => Promise<any>;
 
 app.use(express.json());
-app.use(cors({ exposedHeaders: ["Content-Disposition"] }));
+app.use(
+  cors({
+    origin: "*",
+    exposedHeaders: ["Content-Disposition"],
+  })
+);
 
 if (!fs.existsSync(BASE_DOWNLOAD_DIR)) fs.mkdirSync(BASE_DOWNLOAD_DIR);
 
