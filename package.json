@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc && pnpm install yt-dlp",
+    "build": "tsc",
+    "postinstall": "pnpm install yt-dlp",
     "start": "yt-dlp --version && node dist/index.js",
     "dev": "nodemon --exec ts-node src/index.ts"
   },
