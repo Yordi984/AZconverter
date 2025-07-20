@@ -6,6 +6,7 @@ import { globSync } from "glob";
 import ytdlp from "yt-dlp-exec";
 import archiver from "archiver";
 import { v4 as uuidv4 } from "uuid";
+import { pipeline } from "stream/promises";
 
 const app = express();
 const PORT = 3000;
@@ -19,7 +20,6 @@ app.use(
   })
 );
 
-// Asegura que el directorio base exista
 if (!fs.existsSync(baseDownloadDir))
   fs.mkdirSync(baseDownloadDir, { recursive: true });
 
@@ -43,12 +43,10 @@ app.post("/download", async (req: Request, res: Response): Promise<void> => {
     return;
   }
 
-  // Crear carpeta temporal única para esta descarga
   const tempDir = path.join(baseDownloadDir, uuidv4());
   fs.mkdirSync(tempDir, { recursive: true });
 
   try {
-    // Descargar audio al directorio temporal
     await ytdlp(url, {
       extractAudio: true,
       audioFormat: "mp3",
@@ -73,19 +71,32 @@ app.post("/download", async (req: Request, res: Response): Promise<void> => {
 
     const fileName = path.basename(filePath);
 
-    // Envía y elimina carpeta completa después
-    res.download(filePath, fileName, async (err) => {
-      if (err) {
-        console.error("❌ Error al enviar el archivo:", err);
-      } else {
-        console.log("✅ Archivo enviado:", fileName);
-      }
+    res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Content-Length", stats.size);
+
+    const fileStream = fs.createReadStream(filePath);
+
+    fileStream.on("end", async () => {
+      console.log("✅ Transferencia completada:", fileName);
       await cleanFolder(tempDir);
     });
+
+    fileStream.on("error", async (err) => {
+      console.error("❌ Error en stream:", err);
+      await cleanFolder(tempDir);
+      if (!res.headersSent) {
+        res.status(500).send("Error enviando el archivo");
+      }
+    });
+
+    await pipeline(fileStream, res);
   } catch (error) {
     console.error("❌ Error al procesar el video:", error);
     await cleanFolder(tempDir);
-    res.status(500).send("❌ Error al procesar el video");
+    if (!res.headersSent) {
+      res.status(500).send("❌ Error al procesar el video");
+    }
   }
 });
 
@@ -97,7 +108,6 @@ app.post("/playlist", async (req: Request, res: Response): Promise<void> => {
     return;
   }
 
-  // Crear carpeta temporal única para esta descarga
   const tempDir = path.join(baseDownloadDir, uuidv4());
   fs.mkdirSync(tempDir, { recursive: true });
 
@@ -119,24 +129,9 @@ app.post("/playlist", async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
+    // Crear ZIP con archiver
     const output = fs.createWriteStream(zipPath);
     const archive = archiver("zip", { zlib: { level: 9 } });
-
-    output.on("close", () => {
-      res.download(zipPath, "playlist.zip", async (err) => {
-        if (err) {
-          console.error("❌ Error al enviar el ZIP:", err);
-        } else {
-          console.log("✅ ZIP enviado");
-        }
-        await cleanFolder(tempDir);
-      });
-    });
-
-    archive.on("error", async (err) => {
-      await cleanFolder(tempDir);
-      throw err;
-    });
 
     archive.pipe(output);
     files.forEach((file) => {
@@ -144,10 +139,48 @@ app.post("/playlist", async (req: Request, res: Response): Promise<void> => {
     });
 
     await archive.finalize();
+
+    // Cuando ZIP esté listo, enviar con stream y luego limpiar
+    output.on("close", async () => {
+      const stats = fs.statSync(zipPath);
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="playlist.zip"`
+      );
+      res.setHeader("Content-Type", "application/zip");
+      res.setHeader("Content-Length", stats.size);
+
+      const zipStream = fs.createReadStream(zipPath);
+
+      zipStream.on("end", async () => {
+        console.log("✅ ZIP enviado y descarga completada");
+        await cleanFolder(tempDir);
+      });
+
+      zipStream.on("error", async (err) => {
+        console.error("❌ Error enviando ZIP:", err);
+        await cleanFolder(tempDir);
+        if (!res.headersSent) {
+          res.status(500).send("Error enviando el ZIP");
+        }
+      });
+
+      await pipeline(zipStream, res);
+    });
+
+    output.on("error", async (err) => {
+      console.error("❌ Error al crear ZIP:", err);
+      await cleanFolder(tempDir);
+      if (!res.headersSent) {
+        res.status(500).send("Error creando el ZIP");
+      }
+    });
   } catch (error) {
     console.error("❌ Error al procesar la playlist:", error);
     await cleanFolder(tempDir);
-    res.status(500).send("❌ Error al procesar la playlist");
+    if (!res.headersSent) {
+      res.status(500).send("❌ Error al procesar la playlist");
+    }
   }
 });
 
