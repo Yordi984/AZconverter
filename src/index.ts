@@ -3,88 +3,156 @@ import cors from "cors";
 import fs from "fs";
 import path from "path";
 import { globSync } from "glob";
-import ytdlp from "yt-dlp-exec";
+import ytdlpRaw from "yt-dlp-exec";
 import archiver from "archiver";
+import { v4 as uuidv4 } from "uuid";
 
 const app = express();
 const PORT = 3000;
+const BASE_DOWNLOAD_DIR = path.resolve(__dirname, "..", "downloads");
 
-const downloadDir = path.join(__dirname, "downloads");
-const zipPath = path.join(__dirname, "downloads.zip");
+const ytdlp = ytdlpRaw as unknown as (
+  url: string,
+  options?: Record<string, any>
+) => Promise<any>;
 
 app.use(express.json());
-app.use(
-  cors({
-    exposedHeaders: ["Content-Disposition"],
-  })
-);
+app.use(cors({ exposedHeaders: ["Content-Disposition"] }));
 
-// Asegura que el directorio exista
-if (!fs.existsSync(downloadDir)) fs.mkdirSync(downloadDir);
+if (!fs.existsSync(BASE_DOWNLOAD_DIR)) fs.mkdirSync(BASE_DOWNLOAD_DIR);
 
-// Ruta para convertir un solo video
+// Elimina caracteres no válidos para nombres de archivo
+const sanitizeFileName = (name: string): string =>
+  name.replace(/[\\/:*?"<>|]/g, "_");
+
+// Limpiar carpeta
+const cleanFolder = (folderPath: string) => {
+  if (fs.existsSync(folderPath)) {
+    fs.readdirSync(folderPath).forEach((file) => {
+      const filePath = path.join(folderPath, file);
+      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    });
+    fs.rmdirSync(folderPath, { recursive: true });
+  }
+};
+
+// Validar URL
+const isValidYouTubeUrl = (url: string): boolean => {
+  try {
+    const parsed = new URL(url);
+    return (
+      parsed.hostname.includes("youtube.com") ||
+      parsed.hostname.includes("youtu.be")
+    );
+  } catch {
+    return false;
+  }
+};
+
+// 🎵 Descargar video individual
 app.post("/download", async (req: Request, res: Response): Promise<void> => {
   const { url } = req.body;
 
-  if (
-    !url ||
-    !/^(https?:\/\/)?(www\.)?(youtube\.com\/watch\?v=|youtu\.be\/)/.test(url)
-  ) {
+  if (!url || !isValidYouTubeUrl(url)) {
     res.status(400).send("❌ URL de YouTube no válida");
     return;
   }
 
+  const tempDir = path.join(BASE_DOWNLOAD_DIR, uuidv4());
+  fs.mkdirSync(tempDir, { recursive: true });
+
   try {
-    await ytdlp(url, {
-      extractAudio: true,
-      audioFormat: "mp3",
-      output: path.join(downloadDir, "%(title)s.%(ext)s"),
+    // Obtener metadatos para obtener el título exacto
+    const info = await ytdlp(url, {
+      dumpSingleJson: true,
       noWarnings: true,
     });
 
-    const files = globSync(`${downloadDir}/*.mp3`);
-    if (files.length === 0) {
-      res.status(404).send("No se encontró el archivo MP3");
+    const sanitizedTitle = sanitizeFileName(info.title);
+    const outputPath = path.join(tempDir, `${sanitizedTitle}.mp3`);
+
+    console.log(`▶️ Descargando: ${info.title}`);
+
+    await ytdlp(url, {
+      extractAudio: true,
+      audioFormat: "mp3",
+      output: outputPath,
+      noWarnings: true,
+    });
+
+    if (!fs.existsSync(outputPath)) {
+      cleanFolder(tempDir);
+      res.status(404).send("❌ No se encontró archivo MP3");
       return;
     }
 
-    const filePath = files[0];
-    const fileName = path.basename(filePath);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${encodeURIComponent(sanitizedTitle)}.mp3"`
+    );
+    res.setHeader("Content-Type", "audio/mpeg");
 
-    res.download(filePath, fileName, (err) => {
-      if (err) {
-        console.error("❌ Error al enviar el archivo:", err);
-      } else {
-        fs.unlinkSync(filePath);
+    const stream = fs.createReadStream(outputPath);
+    stream.pipe(res);
+
+    stream.on("close", () => cleanFolder(tempDir));
+    stream.on("error", (err) => {
+      console.error("❌ Error al transmitir:", err);
+      cleanFolder(tempDir);
+      if (!res.headersSent) {
+        res.status(500).send("❌ Error al enviar el archivo");
       }
     });
-  } catch (error) {
-    console.error("❌ Error al procesar el video:", error);
-    res.status(500).send("Error al procesar el video");
+  } catch (err) {
+    console.error("❌ Error al procesar:", err);
+    cleanFolder(tempDir);
+    res.status(500).send("❌ Error al procesar el video");
   }
 });
 
-// Ruta para convertir una playlist y enviar ZIP
+// 📦 Descargar playlist
 app.post("/playlist", async (req: Request, res: Response): Promise<void> => {
   const { url } = req.body;
 
-  if (!url || !/youtube\.com\/playlist\?list=/.test(url)) {
-    res.status(400).send("❌ URL de Playlist no válida");
+  if (!url || !url.includes("playlist?list=")) {
+    res.status(400).send("❌ URL de playlist no válida");
     return;
   }
 
+  const tempDir = path.join(BASE_DOWNLOAD_DIR, uuidv4());
+  const zipFileName = `${uuidv4()}.zip`;
+  const zipPath = path.join(BASE_DOWNLOAD_DIR, zipFileName);
+  fs.mkdirSync(tempDir, { recursive: true });
+
   try {
-    await ytdlp(url, {
-      extractAudio: true,
-      audioFormat: "mp3",
-      output: path.join(downloadDir, "%(title)s.%(ext)s"),
-      yesPlaylist: true,
+    // Obtener metadatos de la playlist
+    const playlistInfo = await ytdlp(url, {
+      dumpSingleJson: true,
       noWarnings: true,
     });
 
-    const files = globSync(`${downloadDir}/*.mp3`);
+    const entries = playlistInfo.entries as any[];
+
+    // Descargar cada video individualmente
+    for (const video of entries) {
+      const videoUrl = `https://www.youtube.com/watch?v=${video.id}`;
+      const sanitizedTitle = sanitizeFileName(video.title);
+      const outputPath = path.join(tempDir, `${sanitizedTitle}.mp3`);
+
+      console.log(`🎧 Descargando: ${video.title}`);
+
+      await ytdlp(videoUrl, {
+        extractAudio: true,
+        audioFormat: "mp3",
+        output: outputPath,
+        noWarnings: true,
+      });
+    }
+
+    const files = globSync(`${tempDir}/*.mp3`);
     if (files.length === 0) {
-      res.status(404).send("No se encontraron archivos MP3");
+      cleanFolder(tempDir);
+      res.status(404).send("❌ No se encontraron MP3");
       return;
     }
 
@@ -93,12 +161,10 @@ app.post("/playlist", async (req: Request, res: Response): Promise<void> => {
 
     output.on("close", () => {
       res.download(zipPath, "playlist.zip", (err) => {
-        if (err) {
-          console.error("❌ Error al enviar el ZIP:", err);
-        }
-
+        if (err) console.error("❌ Error al enviar ZIP:", err);
         files.forEach((file) => fs.unlinkSync(file));
         if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath);
+        cleanFolder(tempDir);
       });
     });
 
@@ -112,9 +178,11 @@ app.post("/playlist", async (req: Request, res: Response): Promise<void> => {
     });
 
     await archive.finalize();
-  } catch (error) {
-    console.error("❌ Error al procesar la playlist:", error);
-    res.status(500).send("Error al procesar la playlist");
+  } catch (err) {
+    console.error("❌ Error al procesar playlist:", err);
+    cleanFolder(tempDir);
+    if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath);
+    res.status(500).send("❌ Error al procesar la playlist");
   }
 });
 
