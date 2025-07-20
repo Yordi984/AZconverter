@@ -118,6 +118,6 @@ app.post("/playlist", async (req: Request, res: Response): Promise<void> => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Servidor activo en http://localhost:${PORT}`);
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 Servidor activo en http://0.0.0.0:${PORT}`);
 });
