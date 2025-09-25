@@ -6,6 +6,7 @@ import { globSync } from "glob";
 import ytdlpRaw from "yt-dlp-exec";
 import archiver from "archiver";
 import { v4 as uuidv4 } from "uuid";
+import pLimit from "p-limit"; // npm install p-limit
 
 const app = express();
 const PORT = 3000;
@@ -29,11 +30,11 @@ app.options("*", cors());
 
 if (!fs.existsSync(BASE_DOWNLOAD_DIR)) fs.mkdirSync(BASE_DOWNLOAD_DIR);
 
-// Elimina caracteres no válidos para nombres de archivo
+// 🔹 Elimina caracteres no válidos para nombres de archivo
 const sanitizeFileName = (name: string): string =>
   name.replace(/[\\/:*?"<>|]/g, "_");
 
-// Limpiar carpeta
+// 🔹 Limpiar carpeta
 const cleanFolder = (folderPath: string) => {
   if (fs.existsSync(folderPath)) {
     fs.readdirSync(folderPath).forEach((file) => {
@@ -44,7 +45,7 @@ const cleanFolder = (folderPath: string) => {
   }
 };
 
-// Validar URL
+// 🔹 Validar URL
 const isValidYouTubeUrl = (url: string): boolean => {
   try {
     const parsed = new URL(url);
@@ -57,7 +58,9 @@ const isValidYouTubeUrl = (url: string): boolean => {
   }
 };
 
-// 🎵 Descargar video individual
+//
+// 🎵 Descargar video individual (stream directo sin guardar en disco)
+//
 app.post("/download", async (req: Request, res: Response): Promise<void> => {
   const { url } = req.body;
 
@@ -66,33 +69,10 @@ app.post("/download", async (req: Request, res: Response): Promise<void> => {
     return;
   }
 
-  const tempDir = path.join(BASE_DOWNLOAD_DIR, uuidv4());
-  fs.mkdirSync(tempDir, { recursive: true });
-
   try {
-    // Obtener metadatos para obtener el título exacto
-    const info = await ytdlp(url, {
-      dumpSingleJson: true,
-      noWarnings: true,
-    });
-
+    // Solo obtenemos título
+    const info = await ytdlp(url, { dumpSingleJson: true, noWarnings: true });
     const sanitizedTitle = sanitizeFileName(info.title);
-    const outputPath = path.join(tempDir, `${sanitizedTitle}.mp3`);
-
-    console.log(`▶️ Descargando: ${info.title}`);
-
-    await ytdlp(url, {
-      extractAudio: true,
-      audioFormat: "mp3",
-      output: outputPath,
-      noWarnings: true,
-    });
-
-    if (!fs.existsSync(outputPath)) {
-      cleanFolder(tempDir);
-      res.status(404).send("❌ No se encontró archivo MP3");
-      return;
-    }
 
     res.setHeader(
       "Content-Disposition",
@@ -100,25 +80,28 @@ app.post("/download", async (req: Request, res: Response): Promise<void> => {
     );
     res.setHeader("Content-Type", "audio/mpeg");
 
-    const stream = fs.createReadStream(outputPath);
-    stream.pipe(res);
-
-    stream.on("close", () => cleanFolder(tempDir));
-    stream.on("error", (err) => {
-      console.error("❌ Error al transmitir:", err);
-      cleanFolder(tempDir);
-      if (!res.headersSent) {
-        res.status(500).send("❌ Error al enviar el archivo");
-      }
+    // Stream directo yt-dlp -> res
+    const proc: any = ytdlpRaw(url, {
+      extractAudio: true,
+      audioFormat: "mp3",
+      audioQuality: 0,
+      noWarnings: true,
+      noPlaylist: true,
+      output: "-", // salida estándar
     });
+
+    proc.stdout.pipe(res);
+
+    proc.stderr.on("data", (d: any) => console.log("yt-dlp:", d.toString()));
   } catch (err) {
     console.error("❌ Error al procesar:", err);
-    cleanFolder(tempDir);
     res.status(500).send("❌ Error al procesar el video");
   }
 });
 
-// 📦 Descargar playlist
+//
+// 📦 Descargar playlist (descargas en paralelo)
+//
 app.post("/playlist", async (req: Request, res: Response): Promise<void> => {
   const { url } = req.body;
 
@@ -128,34 +111,41 @@ app.post("/playlist", async (req: Request, res: Response): Promise<void> => {
   }
 
   const tempDir = path.join(BASE_DOWNLOAD_DIR, uuidv4());
-  const zipFileName = `${uuidv4()}.zip`;
-  const zipPath = path.join(BASE_DOWNLOAD_DIR, zipFileName);
+  const zipPath = path.join(BASE_DOWNLOAD_DIR, `${uuidv4()}.zip`);
   fs.mkdirSync(tempDir, { recursive: true });
 
   try {
-    // Obtener metadatos de la playlist
     const playlistInfo = await ytdlp(url, {
       dumpSingleJson: true,
       noWarnings: true,
     });
 
     const entries = playlistInfo.entries as any[];
+    console.log(`🎧 Playlist con ${entries.length} videos`);
 
-    // Descargar cada video individualmente
-    for (const video of entries) {
-      const videoUrl = `https://www.youtube.com/watch?v=${video.id}`;
-      const sanitizedTitle = sanitizeFileName(video.title);
-      const outputPath = path.join(tempDir, `${sanitizedTitle}.mp3`);
+    // 🔹 Límite de concurrencia a 3 descargas simultáneas
+    const limit = pLimit(3);
 
-      console.log(`🎧 Descargando: ${video.title}`);
+    await Promise.all(
+      entries.map((video) =>
+        limit(async () => {
+          const videoUrl = `https://www.youtube.com/watch?v=${video.id}`;
+          const sanitizedTitle = sanitizeFileName(video.title);
+          const outputPath = path.join(tempDir, `${sanitizedTitle}.mp3`);
 
-      await ytdlp(videoUrl, {
-        extractAudio: true,
-        audioFormat: "mp3",
-        output: outputPath,
-        noWarnings: true,
-      });
-    }
+          console.log(`▶️ Descargando: ${video.title}`);
+
+          await ytdlp(videoUrl, {
+            extractAudio: true,
+            audioFormat: "mp3",
+            audioQuality: 0,
+            output: outputPath,
+            noWarnings: true,
+            noPlaylist: true,
+          });
+        })
+      )
+    );
 
     const files = globSync(`${tempDir}/*.mp3`);
     if (files.length === 0) {
@@ -164,13 +154,13 @@ app.post("/playlist", async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
+    // 🔹 Crear ZIP
     const output = fs.createWriteStream(zipPath);
     const archive = archiver("zip", { zlib: { level: 9 } });
 
     output.on("close", () => {
       res.download(zipPath, "playlist.zip", (err) => {
         if (err) console.error("❌ Error al enviar ZIP:", err);
-        files.forEach((file) => fs.unlinkSync(file));
         if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath);
         cleanFolder(tempDir);
       });
@@ -187,7 +177,7 @@ app.post("/playlist", async (req: Request, res: Response): Promise<void> => {
 
     await archive.finalize();
   } catch (err) {
-    console.error("❌ Error al procesar playlist:", err);
+    console.error("❌ Error en playlist:", err);
     cleanFolder(tempDir);
     if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath);
     res.status(500).send("❌ Error al procesar la playlist");
