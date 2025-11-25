@@ -1,53 +1,59 @@
 import express, { Request, Response } from "express";
+import http from "http";
 import cors from "cors";
 import fs from "fs";
 import path from "path";
-import { globSync } from "glob";
-import ytdlpRaw from "yt-dlp-exec";
+import { spawn } from "child_process";
 import archiver from "archiver";
+import { Server } from "socket.io";
 import { v4 as uuidv4 } from "uuid";
-import pLimit from "p-limit";
 import tmp from "tmp";
+import pLimit from "p-limit";
+import { globSync } from "glob";
 
+// =========================================================
+// CONFIG
+// =========================================================
 const app = express();
-const PORT = 3000;
-const BASE_DOWNLOAD_DIR = path.resolve(__dirname, "..", "downloads");
+const server = http.createServer(app);
+
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"],
+  },
+});
 
 app.use(express.json());
 app.use(
   cors({
     origin: "*",
-    methods: ["POST", "OPTIONS"],
+    methods: ["GET", "POST", "OPTIONS"],
     exposedHeaders: ["Content-Disposition"],
   })
 );
 app.options("*", cors());
 
-if (!fs.existsSync(BASE_DOWNLOAD_DIR))
-  fs.mkdirSync(BASE_DOWNLOAD_DIR, { recursive: true });
+const PORT = 3000;
+const BASE_DIR = path.resolve(__dirname, "..", "downloads");
 
-// 🔹 Funciones auxiliares
+// Ruta al ejecutable yt-dlp.exe (bin/yt-dlp.exe en la raíz del proyecto)
+const YTDLP_PATH = path.join(process.cwd(), "bin", "yt-dlp.exe");
+
+if (!fs.existsSync(BASE_DIR)) {
+  fs.mkdirSync(BASE_DIR, { recursive: true });
+}
+
+// =========================================================
+// UTILIDADES
+// =========================================================
+
 const sanitizeFileName = (name: string) => {
-  if (!name) return "audio_sin_titulo";
-  return name.replace(/[\\/:*?"<>|]/g, "_").substring(0, 100);
-};
-
-const cleanFolder = (folderPath: string) => {
-  if (fs.existsSync(folderPath)) {
-    try {
-      fs.readdirSync(folderPath).forEach((file) => {
-        const filePath = path.join(folderPath, file);
-        try {
-          if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-        } catch (err) {
-          console.warn(`No se pudo eliminar: ${filePath}`, err);
-        }
-      });
-      fs.rmSync(folderPath, { recursive: true, force: true });
-    } catch (err) {
-      console.warn(`No se pudo limpiar carpeta: ${folderPath}`, err);
-    }
-  }
+  return (name || "audio_sin_titulo")
+    .replace(/[\\/:*?"<>|]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+    .substring(0, 100);
 };
 
 const isValidYouTubeUrl = (url: string) => {
@@ -113,53 +119,97 @@ const extractYouTubeVideoUrl = (
   }
 };
 
-const getVideoInfo = async (url: string, retries = 3): Promise<any> => {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const info = await ytdlpRaw(url, {
-        dumpSingleJson: true,
-        noWarnings: true,
-        noCheckCertificate: true,
-        preferFreeFormats: true,
-        socketTimeout: 30000,
-      });
-      return info;
-    } catch (error: any) {
-      console.warn(`Intento ${attempt} fallido para ${url}:`, error.message);
-      if (attempt === retries) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 2000 * attempt));
+// Obtener info de video o playlist usando yt-dlp (JSON)
+const getVideoInfo = (url: string, isPlaylist = false): Promise<any> => {
+  return new Promise((resolve, reject) => {
+    const args = ["--dump-single-json"];
+    if (!isPlaylist) {
+      args.push("--no-playlist");
     }
-  }
-};
+    args.push(url);
 
-const downloadAudio = async (
-  url: string,
-  outputPath: string
-): Promise<boolean> => {
-  try {
-    await ytdlpRaw(url, {
-      extractAudio: true,
-      audioFormat: "mp3",
-      audioQuality: 0,
-      output: outputPath,
-      noWarnings: true,
-      noPlaylist: true,
-      socketTimeout: 30000,
-      retries: 3,
+    const yt = spawn(YTDLP_PATH, args);
+    let data = "";
 
-      continue: true,
-      noPart: true,
+    yt.stdout.on("data", (chunk) => (data += chunk.toString()));
+
+    yt.on("close", (code) => {
+      if (code === 0) {
+        try {
+          const json = JSON.parse(data);
+          resolve(json);
+        } catch (e) {
+          reject(new Error("Error parseando JSON"));
+        }
+      } else {
+        reject(new Error("yt-dlp falló al obtener info JSON"));
+      }
     });
-    return true;
-  } catch (error: any) {
-    console.error(`Error descargando ${url}:`, error.message);
-    return false;
-  }
+
+    yt.on("error", (err) => reject(err));
+  });
 };
 
-// 🔹 Endpoint para video individual
+// =========================================================
+// 🔥 DESCARGA INDIVIDUAL CON PROGRESO
+// =========================================================
+
+const downloadAudioWithProgress = (
+  url: string,
+  outputPath: string,
+  socketId?: string
+): Promise<void> => {
+  return new Promise((resolve, reject) => {
+    const args = [
+      "-x",
+      "--audio-format",
+      "mp3",
+      "--audio-quality",
+      "0",
+      "--no-warnings",
+      "--no-playlist",
+      "--newline", // ⚡ para que imprima cada progreso en una línea
+      "--progress-template",
+      "%(progress._percent_str)s", // solo " 5.0%", "10.0%", etc
+      "-o",
+      outputPath,
+      url,
+    ];
+
+    const yt = spawn(YTDLP_PATH, args);
+
+    const handleChunk = (data: Buffer) => {
+      const text = data.toString().trim();
+      if (!text) return;
+      console.log("YT-DLP PROGRESS LINE:", text);
+
+      // Ejemplo esperado: "  5.0%" o "10.0%"
+      const match = text.match(/(\d+(?:[.,]\d+)?)%/);
+      if (match && socketId) {
+        const value = Number(match[1].replace(",", "."));
+        console.log("➡️ Progreso detectado:", value);
+        io.to(socketId).emit("progress", { progress: value });
+      }
+    };
+
+    yt.stdout.on("data", handleChunk);
+    yt.stderr.on("data", handleChunk);
+
+    yt.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error("yt-dlp falló al descargar audio"));
+    });
+
+    yt.on("error", (err) => reject(err));
+  });
+};
+
+// =========================================================
+// ENDPOINT: VIDEO INDIVIDUAL
+// =========================================================
+
 app.post("/download", async (req: Request, res: Response) => {
-  const { url } = req.body;
+  const { url, socketId } = req.body;
 
   if (!url || !isValidYouTubeUrl(url)) {
     res.status(400).json({ error: "❌ URL de YouTube no válida" });
@@ -171,8 +221,10 @@ app.post("/download", async (req: Request, res: Response) => {
 
   try {
     console.log(`📥 Procesando video individual: ${cleanUrl}`);
+    console.log("📡 socketId recibido:", socketId);
 
-    const info = await getVideoInfo(cleanUrl);
+    // 1️⃣ Obtener info del video para el nombre
+    const info = await getVideoInfo(cleanUrl, false);
 
     if (!info || !info.title) {
       throw new Error("No se pudo obtener información del video");
@@ -181,16 +233,14 @@ app.post("/download", async (req: Request, res: Response) => {
     const sanitizedTitle = sanitizeFileName(info.title);
     tmpFile = tmp.tmpNameSync({ postfix: ".mp3" });
 
-    const success = await downloadAudio(cleanUrl, tmpFile);
+    // 2️⃣ Descargar con progreso
+    await downloadAudioWithProgress(cleanUrl, tmpFile, socketId);
 
-    if (
-      !success ||
-      !fs.existsSync(tmpFile) ||
-      fs.statSync(tmpFile).size === 0
-    ) {
+    if (!fs.existsSync(tmpFile) || fs.statSync(tmpFile).size === 0) {
       throw new Error("No se pudo descargar el archivo de audio");
     }
 
+    // 3️⃣ Enviar con nombre correcto
     res.setHeader("Content-Type", "audio/mpeg");
     res.setHeader(
       "Content-Disposition",
@@ -231,9 +281,38 @@ app.post("/download", async (req: Request, res: Response) => {
   }
 });
 
-// 🔹 Endpoint para playlist
+// =========================================================
+// 🔥 DESCARGA AUDIO SIMPLE (PARA PLAYLIST)
+// =========================================================
+
+const downloadAudioSimple = (
+  url: string,
+  outputPath: string
+): Promise<boolean> => {
+  return new Promise((resolve) => {
+    const yt = spawn(YTDLP_PATH, [
+      "-x",
+      "--audio-format",
+      "mp3",
+      "--audio-quality",
+      "0",
+      "--no-warnings",
+      "-o",
+      outputPath,
+      url,
+    ]);
+
+    yt.on("close", (code) => resolve(code === 0));
+    yt.on("error", () => resolve(false));
+  });
+};
+
+// =========================================================
+// ENDPOINT: PLAYLIST
+// =========================================================
+
 app.post("/playlist", async (req: Request, res: Response) => {
-  const { url } = req.body;
+  const { url, socketId } = req.body;
 
   if (!url || !isValidYouTubeUrl(url)) {
     res.status(400).json({ error: "❌ URL de YouTube no válida" });
@@ -250,14 +329,16 @@ app.post("/playlist", async (req: Request, res: Response) => {
     return;
   }
 
-  const tempDir = path.join(BASE_DOWNLOAD_DIR, uuidv4());
-  const zipPath = path.join(BASE_DOWNLOAD_DIR, `${uuidv4()}.zip`);
+  const tempDir = path.join(BASE_DIR, uuidv4());
+  const zipPath = path.join(BASE_DIR, `${uuidv4()}.zip`);
 
   try {
     fs.mkdirSync(tempDir, { recursive: true });
 
     console.log(`🎧 Obteniendo información de playlist: ${cleanUrl}`);
-    const playlistInfo = await getVideoInfo(cleanUrl);
+    console.log("📡 socketId recibido:", socketId);
+
+    const playlistInfo = await getVideoInfo(cleanUrl, true);
 
     if (
       !playlistInfo ||
@@ -280,16 +361,31 @@ app.post("/playlist", async (req: Request, res: Response) => {
     }
 
     const limit = pLimit(2);
+    let index = 0;
 
-    const downloadResults = await Promise.allSettled(
+    await Promise.all(
       validEntries.map((video: any) =>
         limit(async () => {
+          index++;
+
           const videoUrl = `https://www.youtube.com/watch?v=${video.id}`;
           const sanitizedTitle = sanitizeFileName(video.title);
           const outputPath = path.join(tempDir, `${sanitizedTitle}.mp3`);
 
+          const percent = Math.round((index / validEntries.length) * 100);
+          console.log(
+            `➡️ Progreso playlist: ${percent}% (${index}/${validEntries.length})`
+          );
+
+          if (socketId) {
+            io.to(socketId).emit("progress", {
+              progress: percent,
+              current: video.title,
+            });
+          }
+
           try {
-            const success = await downloadAudio(videoUrl, outputPath);
+            const success = await downloadAudioSimple(videoUrl, outputPath);
             if (success && fs.existsSync(outputPath)) {
               console.log(`✔ Descargado: ${video.title}`);
               return { success: true, title: video.title };
@@ -303,19 +399,6 @@ app.post("/playlist", async (req: Request, res: Response) => {
           }
         })
       )
-    );
-
-    const successfulDownloads = downloadResults.filter(
-      (
-        result
-      ): result is PromiseFulfilledResult<{
-        success: boolean;
-        title: string;
-      }> => result.status === "fulfilled" && result.value.success
-    );
-
-    console.log(
-      `✅ ${successfulDownloads.length}/${validEntries.length} descargas exitosas`
     );
 
     const files = globSync(`${tempDir}/*.mp3`);
@@ -341,20 +424,29 @@ app.post("/playlist", async (req: Request, res: Response) => {
       archive.finalize();
     });
 
+    const playlistName = sanitizeFileName(playlistInfo.title || "playlist");
+
     res.setHeader("Content-Type", "application/zip");
-    res.setHeader("Content-Disposition", 'attachment; filename="playlist.zip"');
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${playlistName}.zip"`
+    );
 
     const fileStream = fs.createReadStream(zipPath);
     fileStream.pipe(res);
 
     fileStream.on("end", () => {
-      cleanFolder(tempDir);
+      if (fs.existsSync(tempDir)) {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
       if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath);
     });
 
     fileStream.on("error", (err) => {
       console.error("Error enviando ZIP:", err);
-      cleanFolder(tempDir);
+      if (fs.existsSync(tempDir)) {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
       if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath);
       if (!res.headersSent) {
         res.status(500).json({ error: "Error enviando el archivo ZIP" });
@@ -363,7 +455,9 @@ app.post("/playlist", async (req: Request, res: Response) => {
   } catch (err: any) {
     console.error("❌ Error en playlist:", err.message);
 
-    cleanFolder(tempDir);
+    if (fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
     if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath);
 
     if (!res.headersSent) {
@@ -375,14 +469,10 @@ app.post("/playlist", async (req: Request, res: Response) => {
   }
 });
 
-process.on("unhandledRejection", (reason, promise) => {
-  console.error("Unhandled Rejection at:", promise, "reason:", reason);
-});
+// =========================================================
+// INICIAR SERVIDOR
+// =========================================================
 
-process.on("uncaughtException", (error) => {
-  console.error("Uncaught Exception:", error);
-});
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Servidor activo en http://0.0.0.0:${PORT}`);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`🔥 Servidor listo en http://localhost:${PORT}`);
 });
